@@ -1,0 +1,180 @@
+import boto3
+import csv
+from io import StringIO
+from datetime import datetime
+
+# Connect to S3 and EC2 clients
+s3_client = boto3.client('s3')
+ec2_client = boto3.client('ec2')
+
+def get_instance_details(instance):
+    instance_id = instance['InstanceId']
+    instance_type = instance['InstanceType']
+    instance_state = instance['State']['Name']
+    az = instance['Placement']['AvailabilityZone']
+    vpc_id = instance['VpcId']
+    subnet_id = instance['SubnetId']
+    os_version = instance.get('PlatformDetails', 'Linux')  # Default to Linux if platform details not available
+    instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), '')
+    private_ip = instance.get('PrivateIpAddress', 'N/A')
+    public_ip = instance.get('PublicIpAddress', 'N/A')
+    elastic_ip = next((ni.get('Association', {}).get('PublicIp', 'N/A') for ni in instance.get('NetworkInterfaces', [])), 'N/A')
+    environment = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Environment'), '')
+    key_name = instance.get('KeyName', 'N/A')
+    os_product_name = next((pc.get('ProductCodeId', 'N/A') for pc in instance.get('ProductCodes', [])), 'N/A')
+    # Get creation date of the primary network interface (eth0)
+    eni_creation_date = ''
+    network_interfaces = instance.get('NetworkInterfaces', [])
+    for eni in network_interfaces:
+        if eni['Attachment']['DeviceIndex'] == 0:  # Assuming eth0 is the primary network interface
+            eni_creation_date = eni['Attachment']['AttachTime'].strftime('%Y-%m-%d %H:%M:%S')
+            break
+    return {
+        'InstanceId': instance_id,
+        'InstanceName': instance_name,
+        'InstanceType': instance_type,
+        'InstanceState': instance_state,
+        'AvailabilityZone': az,
+        'VpcId': vpc_id,
+        'SubnetId': subnet_id,
+        'OSVersion': os_version,
+        'ENICreationDate': eni_creation_date,
+        'PrivateIP': private_ip,
+        'PublicIP': public_ip,
+        'ElasticIP': elastic_ip,
+        'Environment': environment,
+        'KeyName': key_name,
+        'OSProductName': os_product_name
+    }
+
+def lambda_handler(event, context):
+    try:
+        # Fetch EC2 instance details
+        instances = ec2_client.describe_instances()
+        instance_details = []
+        for reservation in instances['Reservations']:
+            for instance in reservation['Instances']:
+                instance_details.append(get_instance_details(instance))
+        # Create a CSV file with instance details
+        csv_output = StringIO()
+        writer = csv.DictWriter(csv_output, fieldnames=[
+            'Environment', 'InstanceName', 'InstanceId', 'InstanceType', 'InstanceState', 'PrivateIP', 'PublicIP', 'ElasticIP', 'KeyName', 'OSProductName',
+            'AvailabilityZone', 'VpcId', 'SubnetId', 'OSVersion', 'ENICreationDate',
+        ])
+        writer.writeheader()
+        writer.writerows(instance_details)
+        # Specify your S3 bucket name and folder path for EC2 instance details
+        bucket_name = 'monthlyinventory-report-ind'  # Replace with your actual bucket name
+        folder_path = 'EC2-Instance-Monthly-Inventory report/'  # Renamed folder for EC2 instances
+        # Upload CSV file with EC2 instance details to S3 with the timestamped filename
+        current_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        s3_client.put_object(Bucket=bucket_name, Key=f'{folder_path}EC2_Instance_Report_{current_timestamp}.csv', Body=csv_output.getvalue())
+        csv_output.close()
+        print(f"CSV file with EC2 instance details uploaded to S3 bucket {bucket_name} in the folder {folder_path}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    try:
+        # S3 bucket and file configuration for EBS Volume Report
+        ebs_bucket_name = 'monthlyinventory-report'  # Replace with your S3 bucket name
+        ebs_folder_path = 'EBS-Volume-Monthly-Inventory report/'  # Renamed folder for EBS volumes
+        # Fetch all EBS volumes
+        volumes = ec2_client.describe_volumes()['Volumes']
+        volume_details = []
+        for volume in volumes:
+            name = next((item['Value'] for item in volume.get('Tags', []) if item["Key"] == "Name"), None)
+            instance_id = volume['Attachments'][0]['InstanceId'] if volume['Attachments'] else 'N/A'
+            instance_details = {}
+            if instance_id != 'N/A':
+                instance_response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                instance = instance_response['Reservations'][0]['Instances'][0]
+                instance_details = {
+                    'InstanceType': instance['InstanceType'],
+                    'InstanceState': instance['State']['Name'],
+                    'InstanceAZ': instance['Placement']['AvailabilityZone']
+                }
+            volume_detail = [
+                name,
+                volume['VolumeId'],
+                volume.get('VolumeType', 'N/A'),  # Handle the VolumeType key
+                volume['Size'],
+                volume.get('Iops', 'N/A'),
+                volume.get('Throughput', 'N/A'),
+                volume.get('SnapshotId', 'N/A'),
+                volume['CreateTime'].strftime('%Y-%m-%d %H:%M:%S'),
+                volume['AvailabilityZone'],
+                volume['State'],
+                volume['Encrypted'],
+                volume.get('KmsKeyId', 'N/A'),
+                volume.get('FastRestored', False),
+                volume.get('MultiAttachEnabled', False),
+                instance_id,
+                instance_details.get('InstanceType', 'N/A'),
+                instance_details.get('InstanceState', 'N/A'),
+                instance_details.get('InstanceAZ', 'N/A')
+            ]
+            volume_details.append(volume_detail)
+        # Create a CSV file with EBS volume details
+        csv_file = StringIO()
+        csv_writer = csv.writer(csv_file)
+        header = ['Name', 'Volume ID', 'Type', 'Size', 'IOPS', 'Throughput', 'Snapshot ID', 'Created', 'Availability Zone', 'Volume state', 'Encryption', 'KMS key ID', 'Fast snapshot restored', 'Multi-Attach enabled', 'Attached Instance ID', 'Instance Type', 'Instance State', 'Instance AZ']
+        csv_writer.writerow(header)
+        csv_writer.writerows(volume_details)
+        csv_file.seek(0)  # Go to the start of the stream
+        # Upload the CSV file with EBS volume details to S3 with the timestamped filename
+        ebs_current_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        s3_client.put_object(Bucket=ebs_bucket_name, Key=f'{ebs_folder_path}EBS_Volume_Report_{ebs_current_timestamp}.csv', Body=csv_file.getvalue())
+        csv_file.close()
+        print(f"CSV file with EBS volume details uploaded to S3 bucket {ebs_bucket_name} in the folder {ebs_folder_path}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    try:
+        # S3 bucket and file configuration for EC2 Snapshot Report
+        snapshot_bucket_name = 'monthlyinventory-report'  # Replace with your S3 bucket name
+        snapshot_folder_path = 'Snapshot-Monthly-Report/'  # Folder for EC2 snapshots
+
+        # Get all snapshots for the current month
+        current_month = datetime.now().strftime('%m')
+        current_year = datetime.now().strftime('%Y')
+        response = ec2_client.describe_snapshots(OwnerIds=['self'])
+        snapshots = {}
+        
+        for snapshot in response['Snapshots']:
+            snapshot_date = snapshot['StartTime']
+            if snapshot_date.strftime('%m') == current_month and snapshot_date.strftime('%Y') == current_year:
+                # Check if this snapshot is the latest for the volume
+                volume_id = snapshot['VolumeId']
+                if volume_id not in snapshots or snapshots[volume_id]['StartTime'] < snapshot_date:
+                    snapshots[volume_id] = snapshot
+
+        # Prepare data for CSV
+        snapshot_data = [{
+            'Snapshot Name': snap.get('Description', 'N/A'),
+            'Snapshot ID': snap['SnapshotId'],
+            'Size(GB)': snap['VolumeSize'],
+            'Creation Date': snap['StartTime'].strftime('%Y-%m-%d %H:%M:%S'),
+            'Description': snap.get('Description', 'N/A'),
+            'Storage type': snap.get('VolumeType', 'N/A'),  # Handle the VolumeType key
+            'Snapshot status': snap['State'],
+            'Encryption': 'Yes' if snap['Encrypted'] else 'No'
+        } for snap in snapshots.values()]
+
+        # Create a CSV file with the snapshot details
+        csv_file = StringIO()
+        fieldnames = ['Snapshot Name', 'Snapshot ID', 'Size(GB)', 'Creation Date', 'Description', 'Storage type', 'Snapshot status', 'Encryption']
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(snapshot_data)
+        csv_file.seek(0)  # Go to the start of the stream
+
+        # Upload the CSV file to S3
+        current_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        s3_client.put_object(Bucket=snapshot_bucket_name, Key=f'{snapshot_folder_path}Snapshot_Report_{current_timestamp}.csv', Body=csv_file.getvalue())
+        csv_file.close()
+        print(f"CSV file with EC2 snapshot details uploaded to S3 bucket {snapshot_bucket_name} in the folder {snapshot_folder_path}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Assuming this is being run in a Lambda function, you would set up the event and context accordingly.
+# For local testing or script running, you can manually call lambda_handler(None, None)
