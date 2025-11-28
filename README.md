@@ -4,6 +4,7 @@ MonthlyInventoryReport-Automation using AWSLambda and Python Boto3
 # 📦 AWS EC2 / EBS / Snapshot Monthly Inventory – Lambda Automation
 
 Automated Monthly Inventory Reports for EC2 Instances, EBS Volumes, and Snapshots
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/26b96962-7256-493d-a245-5009e43379a7" />
 
 ## 📘 Overview
 
